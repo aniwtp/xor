@@ -1,0 +1,7 @@
+[package]
+name = "xor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ntex = { version = "=3.10.1", features = ["compio"] }
