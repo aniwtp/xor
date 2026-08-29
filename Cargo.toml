@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 ntex = { version = "=3.10.1", features = ["compio"] }
+getrandom = "0.4"
+miniz_oxide = "0.8"

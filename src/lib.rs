@@ -1,15 +1,22 @@
-//! XOR obfuscation middleware with replay protection.
+//! Obfuscation middleware with replay protection and built-in compression.
 //!
-//! Lock-free, u32 optimized, with Double-Buffered rotating bitsets
-//! to prevent long-term collisions.
+//! Wire format: MAGIC(4) + raw-deflate(payload), obfuscated with a keyed
+//! byte codec. Compression happens *before* obfuscation: any keyed byte
+//! transform destroys compressibility, so the compressor must see the
+//! plaintext. This also shrinks traffic instead of just hiding it.
+//!
+//! The codec is a seeded S-box + slowly rotating XOR mask: bijective per
+//! position class, O(1 lookup + xor) per byte, trivial to reimplement on the
+//! client (see `Codec::decode` / `decode_body`).
+//!
+//! Lock-free, u32 keys, Double-Buffered rotating bitsets for replay
+//! protection.
 
-use std::fs::File;
-use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ntex::SharedCfg;
 use ntex::http::body::{Body, ResponseBody};
@@ -20,46 +27,126 @@ use ntex::service::{Middleware, Service, ServiceCtx};
 use ntex::util::{Bytes, Stream};
 use ntex::web::{ErrorRenderer, WebRequest, WebResponse};
 
+use miniz_oxide::deflate::compress_to_vec;
+use miniz_oxide::inflate::decompress_to_vec;
+
 const MAGIC_LEN: usize = 4;
 const MAGIC: [u8; MAGIC_LEN] = [0xC0, 0xDE, 0x5E, 0xED];
 
+/// Уровень сжатия miniz_oxide: 1 (быстро) … 10 (максимально). 4 — быстрый
+/// режим, сопоставимый с flate2's Compression::fast.
+const COMPRESSION_LEVEL: u8 = 4;
+
 pub const KEY_HEADER: &str = "x-key";
 
+pub const MAX_BODY_LEN: usize = 8 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
-// Crypto Primitives
+// Codec: keyed, bijective, cheap byte obfuscation
 // ---------------------------------------------------------------------------
 
-fn xor_body(data: &mut [u8], seed: u32) {
-    let mut state = seed;
-    for chunk in data.chunks_mut(4) {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        let key = state.to_le_bytes();
-        for (b, k) in chunk.iter_mut().zip(key.iter()) {
-            *b ^= *k;
+/// Биективный кодек, производный от u32-ключа.
+///
+/// `encode`: b -> sbox[b] ^ mask[i % 32]
+/// `decode`: b -> inv[b ^ mask[i % 32]]
+pub struct Codec {
+    sbox: [u8; 256],
+    inv: [u8; 256],
+    mask: [u8; MASK_LEN],
+}
+
+const MASK_LEN: usize = 32;
+const SPLITMIX32_GAMMA: u32 = 0x9E3779B9;
+
+fn splitmix32_finalize(mut z: u32) -> u32 {
+    z ^= z >> 16;
+    z = z.wrapping_mul(0x85EBCA6B);
+    z ^= z >> 13;
+    z = z.wrapping_mul(0xC2B2AE35);
+    z ^ (z >> 16)
+}
+
+fn splitmix32(state: &mut u32) -> u32 {
+    *state = state.wrapping_add(SPLITMIX32_GAMMA);
+    splitmix32_finalize(*state)
+}
+
+impl Codec {
+    pub fn new(key: u32) -> Self {
+        let mut st = key;
+
+        let mut sbox = [0u8; 256];
+        for (i, v) in sbox.iter_mut().enumerate() {
+            *v = i as u8;
+        }
+        // Fisher-Yates поверх splitmix32 — детерминированная перестановка алфавита.
+        for i in (1..256).rev() {
+            let j = (splitmix32(&mut st) as usize) % (i + 1);
+            sbox.swap(i, j);
+        }
+
+        let mut inv = [0u8; 256];
+        for (i, &v) in sbox.iter().enumerate() {
+            inv[v as usize] = i as u8;
+        }
+
+        let mut mask = [0u8; MASK_LEN];
+        for m in mask.iter_mut() {
+            *m = splitmix32(&mut st) as u8;
+        }
+
+        Self { sbox, inv, mask }
+    }
+
+    #[inline]
+    pub fn encode(&self, data: &mut [u8]) {
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = self.sbox[*b as usize] ^ self.mask[i & (MASK_LEN - 1)];
+        }
+    }
+
+    #[inline]
+    pub fn decode(&self, data: &mut [u8]) {
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = self.inv[(*b ^ self.mask[i & (MASK_LEN - 1)]) as usize];
         }
     }
 }
 
-fn xor_check_magic(data: &mut [u8], seed: u32) -> bool {
-    if data.len() < MAGIC_LEN {
-        return false;
+/// Кодирование с ключом (хелпер для клиентской стороны).
+pub fn encode_body(data: &mut [u8], key: u32) {
+    Codec::new(key).encode(data);
+}
+
+/// Декодирование с ключом (хелпер для клиентской стороны).
+pub fn decode_body(data: &mut [u8], key: u32) {
+    Codec::new(key).decode(data);
+}
+
+/// Полный формат кадра: MAGIC + raw-deflate(payload), всё закодировано ключом.
+pub fn encode_frame(payload: &[u8], key: u32) -> Vec<u8> {
+    let frame = compress_to_vec(payload, COMPRESSION_LEVEL);
+
+    let mut out = Vec::with_capacity(frame.len() + MAGIC_LEN);
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&frame);
+    Codec::new(key).encode(&mut out);
+    out
+}
+
+/// Обратное к `encode_frame`. Возвращает распакованный payload.
+pub fn decode_frame(frame: &[u8], key: u32) -> Option<Vec<u8>> {
+    if frame.len() < MAGIC_LEN {
+        return None;
     }
-    let mut state = seed;
-    for (i, chunk) in data.chunks_mut(4).enumerate() {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        let key = state.to_le_bytes();
-        for (b, k) in chunk.iter_mut().zip(key.iter()) {
-            *b ^= *k;
-        }
-        if i == 0 && chunk != MAGIC {
-            return false;
-        }
+    let mut buf = frame.to_vec();
+    Codec::new(key).decode(&mut buf);
+    if buf[..MAGIC_LEN] != MAGIC {
+        return None;
     }
-    true
+
+    let decompressed = decompress_to_vec(&buf[MAGIC_LEN..]).ok()?;
+    Some(decompressed)
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +162,10 @@ struct XorInner {
     resp_prng_state: AtomicU32,
     /// Размер одного битсета в u64 словах.
     words_len: usize,
+    /// Секунды UNIX последней ротации.
+    last_rotation: AtomicU64,
+    /// Интервал ротации в секундах.
+    rotation_secs: u64,
 }
 
 #[derive(Clone)]
@@ -82,21 +173,9 @@ pub struct XorState {
     inner: Arc<XorInner>,
 }
 
-const SPLITMIX32_GAMMA: u32 = 0x9E3779B9;
-
-fn splitmix32_finalize(mut z: u32) -> u32 {
-    z ^= z >> 16;
-    z = z.wrapping_mul(0x85EBCA6B);
-    z ^= z >> 13;
-    z = z.wrapping_mul(0xC2B2AE35);
-    z ^ (z >> 16)
-}
-
 fn random_u32_seed() -> u32 {
     let mut buf = [0u8; 4];
-    File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .expect("failed to seed response-key PRNG");
+    getrandom::fill(&mut buf).expect("failed to seed response-key PRNG");
     u32::from_le_bytes(buf)
 }
 
@@ -113,25 +192,20 @@ impl XorState {
             b2.push(AtomicU64::new(0));
         }
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let rotation_secs = rotation_interval.as_secs().max(1);
         let inner = Arc::new(XorInner {
             bitsets: [b1, b2],
             active_idx: AtomicUsize::new(0),
             resp_prng_state: AtomicU32::new(random_u32_seed()),
             words_len: bitset_words,
+            last_rotation: AtomicU64::new(now),
+            rotation_secs,
         });
-
-        let state = Self { inner };
-
-        // Запускаем фоновую задачу для очистки старых ключей без блокировок
-        let state_clone = state.clone();
-        ntex::rt::spawn(async move {
-            loop {
-                ntex::time::sleep(rotation_interval).await;
-                state_clone.rotate_bitsets();
-            }
-        });
-
-        state
+        Self { inner }
     }
 
     fn rotate_bitsets(&self) {
@@ -146,6 +220,27 @@ impl XorState {
         // 2. Атомарно переключаем активный индекс.
         // Теперь все новые mark_used пойдут в свежий пустой битсет.
         self.inner.active_idx.store(next, Ordering::Release);
+    }
+
+    /// Ленивая ротация: вызывается на пути запросов, реально выполняется
+    /// не чаще одного раза за интервал (CAS на timestamp).
+    fn maybe_rotate(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.inner.last_rotation.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.inner.rotation_secs {
+            return;
+        }
+        if self
+            .inner
+            .last_rotation
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.rotate_bitsets();
+        }
     }
 
     pub fn is_fresh(&self, key: u32) -> bool {
@@ -201,18 +296,18 @@ impl Stream for OneShot {
 }
 
 async fn drain_payload(pl: &mut Payload) -> Bytes {
-    let mut body = Bytes::new();
+    let mut body = Vec::new();
     while let Some(chunk) = pl.recv().await {
         if let Ok(b) = chunk {
-            let mut v = Vec::with_capacity(body.len() + b.len());
-            v.extend_from_slice(&body);
-            v.extend_from_slice(&b);
-            body = Bytes::from(v);
+            if body.len().saturating_add(b.len()) > MAX_BODY_LEN {
+                continue;
+            }
+            body.extend_from_slice(&b);
         } else {
             break;
         }
     }
-    body
+    Bytes::from(body)
 }
 
 fn body_to_bytes(body: &Body) -> Bytes {
@@ -295,13 +390,13 @@ where
                 return Ok(bad_request(req));
             }
 
-            let mut dec = body_bytes.to_vec();
-            if !xor_check_magic(&mut dec, k) {
+            let Some(dec) = decode_frame(&body_bytes, k) else {
                 return Ok(bad_request(req));
-            }
+            };
 
             self.state.mark_used(k);
-            Bytes::copy_from_slice(&dec[MAGIC_LEN..])
+            self.state.maybe_rotate();
+            Bytes::from(dec)
         };
 
         req.set_payload(Payload::from_stream(OneShot(Some(clean_body))));
@@ -315,9 +410,8 @@ where
         if raw.is_empty() {
             Ok(res.map_body(|_head, _body| ResponseBody::Body(Body::Empty)))
         } else {
-            let mut buf = raw.to_vec();
             let rk = self.state.next_resp_key();
-            xor_body(&mut buf, rk);
+            let buf = encode_frame(&raw, rk);
 
             res = res.map_body(|_head, _body| ResponseBody::from(Body::from(buf)));
 
@@ -326,5 +420,87 @@ where
             }
             Ok(res)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_plaintext() -> Vec<u8> {
+        let mut v = Vec::new();
+        for i in 0..20000u32 {
+            let line = format!(
+                "item_id={};title=Example Title {};price={}\n",
+                i % 9973,
+                i % 500,
+                i % 40000
+            );
+            v.extend_from_slice(line.as_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn roundtrip_all_keys() {
+        for key in [0u32, 1, 0xDEADBEEF, 0xFFFFFFFF, 123456789] {
+            let mut data = (0..=255u8).cycle().take(1000).collect::<Vec<u8>>();
+            let orig = data.clone();
+            encode_body(&mut data, key);
+            assert_ne!(data, orig);
+            decode_body(&mut data, key);
+            assert_eq!(data, orig);
+        }
+    }
+
+    #[test]
+    fn frame_roundtrip() {
+        let plain = sample_plaintext();
+        for key in [0u32, 42, 0xCAFEBABE] {
+            let frame = encode_frame(&plain, key);
+            assert_eq!(decode_frame(&frame, key), Some(plain.clone()));
+        }
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let plain = b"hello world";
+        let frame = encode_frame(plain, 42);
+        assert!(decode_frame(&frame, 43).is_none());
+    }
+
+    #[test]
+    fn frame_is_compressed() {
+        let plain = sample_plaintext();
+        let frame = encode_frame(&plain, 0xCAFEBABE);
+        assert!(
+            frame.len() < plain.len() / 3,
+            "frame {} not compressed (plain {})",
+            frame.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
+    fn perf_smoke() {
+        let plain = sample_plaintext();
+        let n = 20;
+
+        let t = std::time::Instant::now();
+        let mut frame = Vec::new();
+        for _ in 0..n {
+            frame = encode_frame(&plain, 0xCAFEBABE);
+        }
+        let enc_mb_s = (plain.len() * n) as f64 / t.elapsed().as_secs_f64() / 1e6;
+
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            assert!(decode_frame(&frame, 0xCAFEBABE).is_some());
+        }
+        let dec_mb_s = (plain.len() * n) as f64 / t.elapsed().as_secs_f64() / 1e6;
+
+        println!("encode: {enc_mb_s:.0} MB/s, decode: {dec_mb_s:.0} MB/s");
+        assert!(enc_mb_s > 50.0, "encode too slow: {enc_mb_s}");
+        assert!(dec_mb_s > 50.0, "decode too slow: {dec_mb_s}");
     }
 }
