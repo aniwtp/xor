@@ -449,7 +449,7 @@ where
         } else {
             let rk = self.state.next_resp_key();
             let buf = encode_frame(&raw, rk);
-
+            res = res.map_body(|_head, _body| ResponseBody::from(Body::from(buf)));
             if let Ok(val) = HeaderValue::from_str(&rk.to_string()) {
                 res.headers_mut().insert(HeaderName::from_static(KEY_HEADER), val);
             }
