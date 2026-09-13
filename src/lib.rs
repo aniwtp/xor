@@ -318,7 +318,32 @@ fn body_to_bytes(body: &Body) -> Bytes {
 }
 
 fn bad_request<Err: ErrorRenderer>(req: WebRequest<Err>) -> WebResponse {
-    req.into_response(ntex::http::Response::new(StatusCode::BAD_REQUEST))
+    let mut res = req.into_response(ntex::http::Response::new(StatusCode::BAD_REQUEST));
+    with_cors(res.headers_mut());
+    res
+}
+
+/// CORS-заголовки для браузерных фронтов: токены едут заголовками
+/// (`x-key`, `X-Session-Token`, `X-Team-Token`), кук нет — `*` достаточно.
+/// Публичная: error_response хендлеры сервисов добавляют её вручную,
+/// т.к. middleware не видит ответы ошибок.
+pub fn with_cors(headers: &mut ntex::http::header::HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-allow-headers"),
+        HeaderValue::from_static("x-key, X-Session-Token, X-Team-Token, content-type"),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-allow-methods"),
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-max-age"),
+        HeaderValue::from_static("86400"),
+    );
 }
 
 pub struct XorMiddleware {
@@ -370,6 +395,14 @@ where
         mut req: WebRequest<Err>,
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<WebResponse, Self::Error> {
+        // CORS для браузерных фронтов (админка ходит на домены сервисов
+        // напрямую): preflight закрываем здесь, простым запросам ставим
+        // разрешающие заголовки внизу через `with_cors`.
+        if req.method() == ntex::http::Method::OPTIONS {
+            let mut res = req.into_response(ntex::http::Response::new(StatusCode::NO_CONTENT));
+            with_cors(res.headers_mut());
+            return Ok(res);
+        }
         let key: Option<u32> = req
             .headers()
             .get(KEY_HEADER)
@@ -404,20 +437,23 @@ where
 
         let raw = match res.take_body() {
             ResponseBody::Body(b) => body_to_bytes(&b),
-            ResponseBody::Other(_) => return Ok(res),
+            ResponseBody::Other(_) => {
+                with_cors(res.headers_mut());
+                return Ok(res);
+            },
         };
 
         if raw.is_empty() {
+            with_cors(res.headers_mut());
             Ok(res.map_body(|_head, _body| ResponseBody::Body(Body::Empty)))
         } else {
             let rk = self.state.next_resp_key();
             let buf = encode_frame(&raw, rk);
 
-            res = res.map_body(|_head, _body| ResponseBody::from(Body::from(buf)));
-
             if let Ok(val) = HeaderValue::from_str(&rk.to_string()) {
                 res.headers_mut().insert(HeaderName::from_static(KEY_HEADER), val);
             }
+            with_cors(res.headers_mut());
             Ok(res)
         }
     }
