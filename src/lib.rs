@@ -344,6 +344,13 @@ pub fn with_cors(headers: &mut ntex::http::header::HeaderMap) {
         HeaderName::from_static("access-control-max-age"),
         HeaderValue::from_static("86400"),
     );
+    // Ключ ответа обязан быть ВИДИМ кросс-доменному JS: без expose-headers
+    // браузер отдаёт из `x-key` только safelisted-заголовки, клиент не может
+    // декодировать кадр («нет x-key в ответе»).
+    headers.insert(
+        HeaderName::from_static("access-control-expose-headers"),
+        HeaderValue::from_static("x-key"),
+    );
 }
 
 pub struct XorMiddleware {
@@ -554,6 +561,23 @@ mod tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let body = test::read_body(resp).await;
         assert_eq!(body.as_ref(), b"PNGDATA", "тело искажено middleware");
+    }
+
+    #[test]
+    fn cors_exposes_response_key() {
+        // Кросс-доменный JS читает только safelisted-заголовки: без
+        // expose-headers клиент не увидит `x-key` и не декодирует кадр.
+        let mut headers = ntex::http::header::HeaderMap::new();
+        with_cors(&mut headers);
+        let exposed = headers
+            .get("access-control-expose-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(exposed, "x-key");
+        assert_eq!(
+            headers.get("access-control-allow-origin").unwrap(),
+            "*"
+        );
     }
 
     #[test]
