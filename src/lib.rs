@@ -435,8 +435,17 @@ where
         req.set_payload(Payload::from_stream(OneShot(Some(clean_body))));
         let mut res = ctx.call(&self.service, req).await.map_err(Err::Container::from)?;
 
+        // Стримовые тела (`ResponseBody::Other`) — не наши: их байты пойдут
+        // клиенту как есть (картинки, файлы). `take_body()` их бы обнулил,
+        // поэтому проверяем вариант по ссылке и выходим ДО изъятия тела.
+        if matches!(res.response().body(), ResponseBody::Other(_)) {
+            with_cors(res.headers_mut());
+            return Ok(res);
+        }
+
         let raw = match res.take_body() {
             ResponseBody::Body(b) => body_to_bytes(&b),
+            // Недостижимо: выше поймали Other до take_body.
             ResponseBody::Other(_) => {
                 with_cors(res.headers_mut());
                 return Ok(res);
@@ -515,6 +524,36 @@ mod tests {
             frame.len(),
             plain.len()
         );
+    }
+
+    /// Стримовое (`ResponseBody::Other`) тело — не наше: байты обязаны дойти
+    /// до клиента как есть, без XOR-кадра. Регресс: `take_body()` их обнулял.
+    #[ntex::test]
+    async fn other_body_passes_through() {
+        use ntex::http::body::Body;
+        use ntex::web::{self, test};
+
+        let state = XorState::new(1024, Duration::from_secs(60));
+        let app = test::init_service(
+            web::App::new().middleware(XorMiddleware::new(state)).service(
+                web::resource("/img").route(web::get().to(|| async {
+                    Ok::<_, web::Error>(
+                        web::HttpResponse::Ok()
+                            .content_type("image/png")
+                            .body(Body::from_slice(b"PNGDATA"))
+                            .into_body::<Body>(),
+                    )
+                })),
+            ),
+        )
+        .await;
+
+        let req = test::TestRequest::get().uri("/img").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), ntex::http::StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        let body = test::read_body(resp).await;
+        assert_eq!(body.as_ref(), b"PNGDATA", "тело искажено middleware");
     }
 
     #[test]
