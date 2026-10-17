@@ -1,64 +1,78 @@
 //! Obfuscation middleware with replay protection and built-in compression.
 //!
-//! Wire format: MAGIC(4) + raw-deflate(payload), obfuscated with a keyed
-//! byte codec. Compression happens *before* obfuscation: any keyed byte
-//! transform destroys compressibility, so the compressor must see the
-//! plaintext. This also shrinks traffic instead of just hiding it.
+//! Goal: make bodies unreadable at a glance and small on the wire, at near
+//! zero CPU cost on both ends. This is obfuscation, not encryption: the u32
+//! key travels in the `x-key` header next to the body, confidentiality must
+//! come from TLS.
 //!
-//! The codec is a seeded S-box + slowly rotating XOR mask: bijective per
-//! position class, O(1 lookup + xor) per byte, trivial to reimplement on the
-//! client (see `Codec::decode` / `decode_body`).
+//! # Wire format (v2)
 //!
-//! Lock-free, u32 keys, Double-Buffered rotating bitsets for replay
-//! protection.
+//! `frame = xor_keystream(key, MAGIC(2) || MODE(1) || body)`
+//!
+//! * `MODE_RAW`     — `body` is the payload as is (tiny or incompressible).
+//! * `MODE_DEFLATE` — `body` is raw deflate (RFC 1951) of the payload.
+//!
+//! Compression runs *before* obfuscation: any keyed byte transform destroys
+//! compressibility. Raw deflate is what every client already has natively
+//! (Node `zlib.*RawSync`, browsers `DecompressionStream('deflate-raw')`).
+//!
+//! # Keystream
+//!
+//! Counter mode over a 32-bit mixer: `ks[i] = fmix32(seed + (i + 1) * GAMMA)`
+//! with `seed = fmix32(key)`, applied to little-endian u32 words (the tail is
+//! xored with the leading bytes of the next word). Symmetric, no per-key
+//! setup, no tables, no allocation; the same code encodes and decodes.
+//!
+//! # Replay protection
+//!
+//! Lock-free, u32 keys, double-buffered rotating bitsets: a key is accepted at
+//! most once per `rotation_interval`..`2 * rotation_interval` window.
 
+use std::cell::RefCell;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use ntex::SharedCfg;
 use ntex::http::body::{Body, ResponseBody};
 use ntex::http::error::PayloadError;
-use ntex::http::header::{HeaderName, HeaderValue};
-use ntex::http::{Payload, StatusCode};
+use ntex::http::header::{HeaderMap, HeaderName, HeaderValue};
+use ntex::http::{Method, Payload, StatusCode};
 use ntex::service::{Middleware, Service, ServiceCtx};
 use ntex::util::{Bytes, Stream};
 use ntex::web::{ErrorRenderer, WebRequest, WebResponse};
 
-use miniz_oxide::deflate::compress_to_vec;
-use miniz_oxide::inflate::decompress_to_vec;
-
-const MAGIC_LEN: usize = 4;
-const MAGIC: [u8; MAGIC_LEN] = [0xC0, 0xDE, 0x5E, 0xED];
-
-/// Уровень сжатия miniz_oxide: 1 (быстро) … 10 (максимально). 4 — быстрый
-/// режим, сопоставимый с flate2's Compression::fast.
-const COMPRESSION_LEVEL: u8 = 4;
-
 pub const KEY_HEADER: &str = "x-key";
 
+/// Лимит и на размер тела запроса (кадр), и на размер распакованного
+/// payload (защита от deflate-бомб).
 pub const MAX_BODY_LEN: usize = 8 * 1024 * 1024;
 
+const MAGIC: [u8; 2] = [0xC0, 0xDE];
+const MODE_RAW: u8 = 0;
+const MODE_DEFLATE: u8 = 1;
+const HEADER_LEN: usize = 3;
+
+/// Короче этого сжатие не окупается (оверхед инициализации > выигрыш).
+const MIN_COMPRESS_LEN: usize = 32;
+/// До порога — лучшее сжатие (запросы/ответы API обычно мелкие), выше —
+/// быстрый уровень, чтобы большие ответы не держали воркер.
+const LEVEL_SMALL: u32 = 6;
+const LEVEL_LARGE: u32 = 4;
+const LEVEL_THRESHOLD: usize = 64 * 1024;
+
 // ---------------------------------------------------------------------------
-// Codec: keyed, bijective, cheap byte obfuscation
+// Keystream codec
 // ---------------------------------------------------------------------------
 
-/// Биективный кодек, производный от u32-ключа.
-///
-/// `encode`: b -> sbox[b] ^ mask[i % 32]
-/// `decode`: b -> inv[b ^ mask[i % 32]]
-pub struct Codec {
-    sbox: [u8; 256],
-    inv: [u8; 256],
-    mask: [u8; MASK_LEN],
-}
+const GAMMA: u32 = 0x9E3779B9;
 
-const MASK_LEN: usize = 32;
-const SPLITMIX32_GAMMA: u32 = 0x9E3779B9;
-
-fn splitmix32_finalize(mut z: u32) -> u32 {
+/// murmur3 fmix32 — биекция на u32.
+#[inline(always)]
+fn fmix32(mut z: u32) -> u32 {
     z ^= z >> 16;
     z = z.wrapping_mul(0x85EBCA6B);
     z ^= z >> 13;
@@ -66,87 +80,116 @@ fn splitmix32_finalize(mut z: u32) -> u32 {
     z ^ (z >> 16)
 }
 
-fn splitmix32(state: &mut u32) -> u32 {
-    *state = state.wrapping_add(SPLITMIX32_GAMMA);
-    splitmix32_finalize(*state)
-}
-
-impl Codec {
-    pub fn new(key: u32) -> Self {
-        let mut st = key;
-
-        let mut sbox = [0u8; 256];
-        for (i, v) in sbox.iter_mut().enumerate() {
-            *v = i as u8;
-        }
-        // Fisher-Yates поверх splitmix32 — детерминированная перестановка алфавита.
-        for i in (1..256).rev() {
-            let j = (splitmix32(&mut st) as usize) % (i + 1);
-            sbox.swap(i, j);
-        }
-
-        let mut inv = [0u8; 256];
-        for (i, &v) in sbox.iter().enumerate() {
-            inv[v as usize] = i as u8;
-        }
-
-        let mut mask = [0u8; MASK_LEN];
-        for m in mask.iter_mut() {
-            *m = splitmix32(&mut st) as u8;
-        }
-
-        Self { sbox, inv, mask }
+/// Накладывает keystream на `data` (кодирование и декодирование — одна и
+/// та же операция).
+pub fn xor_in_place(data: &mut [u8], key: u32) {
+    let seed = fmix32(key);
+    let (words, tail) = data.as_chunks_mut::<4>();
+    for (i, word) in words.iter_mut().enumerate() {
+        let ks = fmix32(seed.wrapping_add(GAMMA.wrapping_mul(i as u32 + 1)));
+        *word = (u32::from_le_bytes(*word) ^ ks).to_le_bytes();
     }
-
-    #[inline]
-    pub fn encode(&self, data: &mut [u8]) {
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = self.sbox[*b as usize] ^ self.mask[i & (MASK_LEN - 1)];
-        }
-    }
-
-    #[inline]
-    pub fn decode(&self, data: &mut [u8]) {
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = self.inv[(*b ^ self.mask[i & (MASK_LEN - 1)]) as usize];
+    if !tail.is_empty() {
+        let ks = fmix32(seed.wrapping_add(GAMMA.wrapping_mul(words.len() as u32 + 1))).to_le_bytes();
+        for (b, k) in tail.iter_mut().zip(ks) {
+            *b ^= k;
         }
     }
 }
 
-/// Кодирование с ключом (хелпер для клиентской стороны).
-pub fn encode_body(data: &mut [u8], key: u32) {
-    Codec::new(key).encode(data);
+// ---------------------------------------------------------------------------
+// Frame: header + (raw | deflate), keystream over everything
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    // Воркеры ntex — потоки: переиспользуем состояние zlib на поток
+    // (reset дешевле, чем аллокация ~256 КБ окна/хеш-таблиц на запрос).
+    static DEFLATE: RefCell<Compress> = RefCell::new(Compress::new(Compression::new(LEVEL_SMALL), false));
+    static INFLATE: RefCell<Decompress> = RefCell::new(Decompress::new(false));
 }
 
-/// Декодирование с ключом (хелпер для клиентской стороны).
-pub fn decode_body(data: &mut [u8], key: u32) {
-    Codec::new(key).decode(data);
+/// Raw-deflate `payload` в `out` (в пределах его ёмкости). `true` — влезло
+/// целиком.
+fn deflate_into(payload: &[u8], out: &mut Vec<u8>) -> bool {
+    DEFLATE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.reset();
+        let level = if payload.len() <= LEVEL_THRESHOLD { LEVEL_SMALL } else { LEVEL_LARGE };
+        if c.set_level(Compression::new(level)).is_err() {
+            return false;
+        }
+        matches!(c.compress_vec(payload, out, FlushCompress::Finish), Ok(Status::StreamEnd))
+    })
 }
 
-/// Полный формат кадра: MAGIC + raw-deflate(payload), всё закодировано ключом.
+/// Raw-inflate `src`. `None` — битый поток, обрыв или результат > `MAX_BODY_LEN`.
+fn inflate(src: &[u8]) -> Option<Vec<u8>> {
+    INFLATE.with(|d| {
+        let mut d = d.borrow_mut();
+        d.reset(false);
+        let mut out = Vec::with_capacity((src.len() * 4).clamp(512, MAX_BODY_LEN + 1));
+        loop {
+            let consumed = d.total_in() as usize;
+            let status = d.decompress_vec(&src[consumed..], &mut out, FlushDecompress::Finish).ok()?;
+            if out.len() > MAX_BODY_LEN {
+                return None;
+            }
+            match status {
+                Status::StreamEnd => return Some(out),
+                // Нет места под вывод — растим (до лимита); иначе вход оборван.
+                _ if out.len() == out.capacity() => {
+                    out.reserve(out.capacity().min(MAX_BODY_LEN + 1 - out.len()));
+                }
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// Строит кадр: сжимает, если это даёт выигрыш, иначе кладёт payload как есть.
 pub fn encode_frame(payload: &[u8], key: u32) -> Vec<u8> {
-    let frame = compress_to_vec(payload, COMPRESSION_LEVEL);
-
-    let mut out = Vec::with_capacity(frame.len() + MAGIC_LEN);
+    // Ёмкость = размер raw-кадра: не влезло при сжатии — значит выигрыша нет.
+    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&frame);
-    Codec::new(key).encode(&mut out);
+    out.push(MODE_DEFLATE);
+
+    let deflated = payload.len() >= MIN_COMPRESS_LEN
+        && deflate_into(payload, &mut out)
+        && out.len() < HEADER_LEN + payload.len();
+    if !deflated {
+        out.truncate(HEADER_LEN);
+        out[HEADER_LEN - 1] = MODE_RAW;
+        out.extend_from_slice(payload);
+    }
+
+    xor_in_place(&mut out, key);
     out
 }
 
-/// Обратное к `encode_frame`. Возвращает распакованный payload.
-pub fn decode_frame(frame: &[u8], key: u32) -> Option<Vec<u8>> {
-    if frame.len() < MAGIC_LEN {
+/// Обратное к `encode_frame`, потребляет буфер (без лишней копии).
+/// `None` — неверный ключ, битый кадр или распакованный размер > `MAX_BODY_LEN`.
+pub fn decode_frame_owned(mut frame: Vec<u8>, key: u32) -> Option<Vec<u8>> {
+    if frame.len() < HEADER_LEN {
         return None;
     }
-    let mut buf = frame.to_vec();
-    Codec::new(key).decode(&mut buf);
-    if buf[..MAGIC_LEN] != MAGIC {
+    xor_in_place(&mut frame, key);
+    if frame[..MAGIC.len()] != MAGIC {
         return None;
     }
+    match frame[HEADER_LEN - 1] {
+        MODE_RAW if frame.len() - HEADER_LEN <= MAX_BODY_LEN => {
+            frame.copy_within(HEADER_LEN.., 0);
+            frame.truncate(frame.len() - HEADER_LEN);
+            Some(frame)
+        }
+        MODE_DEFLATE => inflate(&frame[HEADER_LEN..]),
+        _ => None,
+    }
+}
 
-    let decompressed = decompress_to_vec(&buf[MAGIC_LEN..]).ok()?;
-    Some(decompressed)
+/// Как `decode_frame_owned`, но не трогает входной буфер.
+pub fn decode_frame(frame: &[u8], key: u32) -> Option<Vec<u8>> {
+    decode_frame_owned(frame.to_vec(), key)
 }
 
 // ---------------------------------------------------------------------------
@@ -160,8 +203,6 @@ struct XorInner {
     active_idx: AtomicUsize,
     /// Lock-free генератор ключей ответов.
     resp_prng_state: AtomicU32,
-    /// Размер одного битсета в u64 словах.
-    words_len: usize,
     /// Секунды UNIX последней ротации.
     last_rotation: AtomicU64,
     /// Интервал ротации в секундах.
@@ -179,38 +220,44 @@ fn random_u32_seed() -> u32 {
     u32::from_le_bytes(buf)
 }
 
-impl XorState {
-    /// Создает стейт и запускает фоновую ротацию (вызывать внутри ntex worker'а)
-    ///
-    /// * `bitset_words` - размер одного буфера. 65536 = 512 КБ памяти = 4.1 млн бит.
-    /// * `rotation_interval` - как часто сбрасывать старые ключи (например, 60 секунд).
-    pub fn new(bitset_words: usize, rotation_interval: Duration) -> Self {
-        let mut b1 = Vec::with_capacity(bitset_words);
-        let mut b2 = Vec::with_capacity(bitset_words);
-        for _ in 0..bitset_words {
-            b1.push(AtomicU64::new(0));
-            b2.push(AtomicU64::new(0));
-        }
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let rotation_secs = rotation_interval.as_secs().max(1);
+impl XorState {
+    /// * `bitset_words` - размер одного буфера в u64-словах (> 0).
+    ///   65536 = 512 КБ на буфер = 4.2 млн бит.
+    /// * `rotation_interval` - период смены буферов (например, 60 секунд).
+    ///   Ротация ленивая: выполняется на пути запросов, фоновых задач нет.
+    pub fn new(bitset_words: usize, rotation_interval: Duration) -> Self {
+        assert!(bitset_words > 0, "bitset_words must be > 0");
+        let new_bitset = || (0..bitset_words).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
         let inner = Arc::new(XorInner {
-            bitsets: [b1, b2],
+            bitsets: [new_bitset(), new_bitset()],
             active_idx: AtomicUsize::new(0),
             resp_prng_state: AtomicU32::new(random_u32_seed()),
-            words_len: bitset_words,
-            last_rotation: AtomicU64::new(now),
-            rotation_secs,
+            last_rotation: AtomicU64::new(now_secs()),
+            rotation_secs: rotation_interval.as_secs().max(1),
         });
         Self { inner }
     }
 
+    /// Позиция ключа в битсете: (индекс слова, маска из двух бит в этом слове).
+    ///
+    /// Два бита в одном u64-слове (blocked bloom, k=2): ложный реплей
+    /// (коллизия честного ключа) на порядок реже, чем при одном бите, а
+    /// проверка и пометка остаются одной атомарной операцией над словом.
+    fn slot(&self, key: u32) -> (usize, u64) {
+        let h1 = fmix32(key);
+        let h2 = fmix32(h1 ^ GAMMA);
+        let word = ((u64::from(h1) * self.inner.bitsets[0].len() as u64) >> 32) as usize;
+        let b1 = h2 & 63;
+        let b2 = (b1 + 1 + (h2 >> 6) % 63) & 63;
+        (word, 1u64 << b1 | 1u64 << b2)
+    }
+
     fn rotate_bitsets(&self) {
-        let current = self.inner.active_idx.load(Ordering::Relaxed);
-        let next = current ^ 1; // меняем 0 на 1 или 1 на 0
+        let next = self.inner.active_idx.load(Ordering::Relaxed) ^ 1;
 
         // 1. Очищаем "неактивный" битсет (пока в него никто не пишет)
         for word in &self.inner.bitsets[next] {
@@ -218,17 +265,14 @@ impl XorState {
         }
 
         // 2. Атомарно переключаем активный индекс.
-        // Теперь все новые mark_used пойдут в свежий пустой битсет.
+        // Теперь все новые claim пойдут в свежий пустой битсет.
         self.inner.active_idx.store(next, Ordering::Release);
     }
 
     /// Ленивая ротация: вызывается на пути запросов, реально выполняется
     /// не чаще одного раза за интервал (CAS на timestamp).
     fn maybe_rotate(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = now_secs();
         let last = self.inner.last_rotation.load(Ordering::Relaxed);
         if now.saturating_sub(last) < self.inner.rotation_secs {
             return;
@@ -243,41 +287,30 @@ impl XorState {
         }
     }
 
+    /// Дешёвая предпроверка (без пометки): ключ не встречался в текущем и
+    /// предыдущем окне. Авторитетна только `claim`.
     pub fn is_fresh(&self, key: u32) -> bool {
-        let bit_index = key as usize % (self.inner.words_len * 64);
-        let word_idx = bit_index / 64;
-        let mask = 1 << (bit_index % 64);
-
-        let active = self.inner.active_idx.load(Ordering::Relaxed);
-        let inactive = active ^ 1;
-
-        // Проверяем текущий буфер
-        if (self.inner.bitsets[active][word_idx].load(Ordering::Relaxed) & mask) != 0 {
-            return false;
-        }
-
-        // Проверяем предыдущий буфер (чтобы защититься от реплеев сразу после ротации)
-        if (self.inner.bitsets[inactive][word_idx].load(Ordering::Relaxed) & mask) != 0 {
-            return false;
-        }
-
-        true
+        let (word, mask) = self.slot(key);
+        // Проверяем оба буфера: текущий и предыдущий (реплеи сразу после ротации).
+        self.inner.bitsets.iter().all(|b| b[word].load(Ordering::Relaxed) & mask != mask)
     }
 
-    pub fn mark_used(&self, key: u32) {
-        let bit_index = key as usize % (self.inner.words_len * 64);
-        let word_idx = bit_index / 64;
-        let mask = 1 << (bit_index % 64);
+    /// Атомарно помечает ключ использованным. `true` — ключ был свежим и
+    /// теперь заявлен нами; `false` — реплей (в т.ч. гонка двух одновременных
+    /// запросов с одним ключом: выигрывает ровно один).
+    pub fn claim(&self, key: u32) -> bool {
+        let (word, mask) = self.slot(key);
+        let active = self.inner.active_idx.load(Ordering::Acquire);
 
-        let active = self.inner.active_idx.load(Ordering::Relaxed);
-
-        // Пишем только в активный буфер
-        self.inner.bitsets[active][word_idx].fetch_or(mask, Ordering::Relaxed);
+        if self.inner.bitsets[active ^ 1][word].load(Ordering::Relaxed) & mask == mask {
+            return false;
+        }
+        self.inner.bitsets[active][word].fetch_or(mask, Ordering::Relaxed) & mask != mask
     }
 
     pub fn next_resp_key(&self) -> u32 {
-        let x = self.inner.resp_prng_state.fetch_add(SPLITMIX32_GAMMA, Ordering::Relaxed);
-        splitmix32_finalize(x)
+        let x = self.inner.resp_prng_state.fetch_add(GAMMA, Ordering::Relaxed);
+        fmix32(x)
     }
 }
 
@@ -295,62 +328,85 @@ impl Stream for OneShot {
     }
 }
 
-async fn drain_payload(pl: &mut Payload) -> Bytes {
-    let mut body = Vec::new();
+enum DrainError {
+    TooLarge,
+    Io,
+}
+
+/// Собирает тело запроса целиком в `Vec` (его же потом декодируем на месте).
+/// `size_hint` — Content-Length, если есть.
+async fn drain_payload(pl: &mut Payload, size_hint: usize) -> Result<Vec<u8>, DrainError> {
+    let mut body = Vec::with_capacity(size_hint);
     while let Some(chunk) = pl.recv().await {
-        if let Ok(b) = chunk {
-            if body.len().saturating_add(b.len()) > MAX_BODY_LEN {
-                continue;
-            }
-            body.extend_from_slice(&b);
-        } else {
-            break;
+        let chunk = chunk.map_err(|_| DrainError::Io)?;
+        if body.len().saturating_add(chunk.len()) > MAX_BODY_LEN {
+            return Err(DrainError::TooLarge);
         }
+        body.extend_from_slice(&chunk);
     }
-    Bytes::from(body)
+    Ok(body)
 }
 
-fn body_to_bytes(body: &Body) -> Bytes {
-    match body {
-        Body::Bytes(b) => b.clone(),
-        _ => Bytes::new(),
-    }
+/// Предсозданные заголовки: имена/значения валидируются один раз, а не на
+/// каждый ответ.
+struct Headers {
+    key: HeaderName,
+    cors: [(HeaderName, HeaderValue); 5],
 }
 
-fn bad_request<Err: ErrorRenderer>(req: WebRequest<Err>) -> WebResponse {
-    let mut res = req.into_response(ntex::http::Response::new(StatusCode::BAD_REQUEST));
-    with_cors(res.headers_mut());
-    res
-}
+static HEADERS: LazyLock<Headers> = LazyLock::new(|| {
+    let h = |name: &'static str, value: &'static str| {
+        (HeaderName::from_static(name), HeaderValue::from_static(value))
+    };
+    Headers {
+        key: HeaderName::from_static(KEY_HEADER),
+        cors: [
+            h("access-control-allow-origin", "*"),
+            h("access-control-allow-headers", "x-key, X-Session-Token, X-Team-Token, content-type"),
+            h("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS"),
+            h("access-control-max-age", "86400"),
+            // Ключ ответа обязан быть ВИДИМ кросс-доменному JS: без expose-headers
+            // браузер отдаёт из `x-key` только safelisted-заголовки, клиент не может
+            // декодировать кадр.
+            h("access-control-expose-headers", "x-key"),
+        ],
+    }
+});
 
 /// CORS-заголовки для браузерных фронтов: токены едут заголовками
 /// (`x-key`, `X-Session-Token`, `X-Team-Token`), кук нет — `*` достаточно.
 /// Публичная: error_response хендлеры сервисов добавляют её вручную,
 /// т.к. middleware не видит ответы ошибок.
-pub fn with_cors(headers: &mut ntex::http::header::HeaderMap) {
-    headers.insert(
-        HeaderName::from_static("access-control-allow-origin"),
-        HeaderValue::from_static("*"),
-    );
-    headers.insert(
-        HeaderName::from_static("access-control-allow-headers"),
-        HeaderValue::from_static("x-key, X-Session-Token, X-Team-Token, content-type"),
-    );
-    headers.insert(
-        HeaderName::from_static("access-control-allow-methods"),
-        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
-    );
-    headers.insert(
-        HeaderName::from_static("access-control-max-age"),
-        HeaderValue::from_static("86400"),
-    );
-    // Ключ ответа обязан быть ВИДИМ кросс-доменному JS: без expose-headers
-    // браузер отдаёт из `x-key` только safelisted-заголовки, клиент не может
-    // декодировать кадр («нет x-key в ответе»).
-    headers.insert(
-        HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static("x-key"),
-    );
+pub fn with_cors(headers: &mut HeaderMap) {
+    for (name, value) in &HEADERS.cors {
+        headers.insert(name.clone(), value.clone());
+    }
+}
+
+fn reject<Err: ErrorRenderer>(req: WebRequest<Err>, status: StatusCode) -> WebResponse {
+    let mut res = req.into_response(ntex::http::Response::new(status));
+    with_cors(res.headers_mut());
+    res
+}
+
+/// Заменяет тело ответа XOR-кадром со свежим ключом (заголовок `x-key`).
+/// Пустое тело остаётся пустым и без ключа.
+fn encode_response(state: &XorState, mut res: WebResponse) -> WebResponse {
+    let raw = match res.take_body() {
+        ResponseBody::Body(Body::Bytes(b)) => b,
+        // Стримовые тела отсеяны вызывающим до `take_body`.
+        _ => Bytes::new(),
+    };
+
+    if raw.is_empty() {
+        return res.map_body(|_head, _body| ResponseBody::Body(Body::Empty));
+    }
+
+    let key = state.next_resp_key();
+    let frame = encode_frame(&raw, key);
+    res = res.map_body(|_head, _body| ResponseBody::from(Body::from(frame)));
+    res.headers_mut().insert(HEADERS.key.clone(), HeaderValue::from(key));
+    res
 }
 
 pub struct XorMiddleware {
@@ -403,81 +459,76 @@ where
         ctx: ServiceCtx<'_, Self>,
     ) -> Result<WebResponse, Self::Error> {
         // CORS для браузерных фронтов (админка ходит на домены сервисов
-        // напрямую): preflight закрываем здесь, простым запросам ставим
-        // разрешающие заголовки внизу через `with_cors`.
-        if req.method() == ntex::http::Method::OPTIONS {
+        // напрямую): preflight закрываем здесь, остальным ставим заголовки внизу.
+        if req.method() == Method::OPTIONS {
             let mut res = req.into_response(ntex::http::Response::new(StatusCode::NO_CONTENT));
             with_cors(res.headers_mut());
             return Ok(res);
         }
+
+        self.state.maybe_rotate();
+
         let key: Option<u32> = req
             .headers()
             .get(KEY_HEADER)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok());
+        let size_hint = req
+            .headers()
+            .get(ntex::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        if size_hint > MAX_BODY_LEN {
+            return Ok(reject(req, StatusCode::PAYLOAD_TOO_LARGE));
+        }
 
         let mut payload = req.take_payload();
-        let body_bytes = drain_payload(&mut payload).await;
+        let body = match drain_payload(&mut payload, size_hint).await {
+            Ok(body) => body,
+            Err(DrainError::TooLarge) => return Ok(reject(req, StatusCode::PAYLOAD_TOO_LARGE)),
+            Err(DrainError::Io) => return Ok(reject(req, StatusCode::BAD_REQUEST)),
+        };
 
-        let clean_body = if body_bytes.is_empty() {
-            body_bytes
+        let clean_body = if body.is_empty() {
+            Bytes::new()
         } else {
             let Some(k) = key else {
-                return Ok(bad_request(req));
+                return Ok(reject(req, StatusCode::BAD_REQUEST));
             };
-
+            // Дешёвый отсев реплеев до распаковки; авторитетна `claim` ниже.
             if !self.state.is_fresh(k) {
-                return Ok(bad_request(req));
+                return Ok(reject(req, StatusCode::BAD_REQUEST));
             }
-
-            let Some(dec) = decode_frame(&body_bytes, k) else {
-                return Ok(bad_request(req));
+            let Some(decoded) = decode_frame_owned(body, k) else {
+                return Ok(reject(req, StatusCode::BAD_REQUEST));
             };
-
-            self.state.mark_used(k);
-            self.state.maybe_rotate();
-            Bytes::from(dec)
+            // Ключ сжигается только после успешного декодирования — мусор не
+            // выжигает чужие ключи; claim атомарен, гонка двух реплеев невозможна.
+            if !self.state.claim(k) {
+                return Ok(reject(req, StatusCode::BAD_REQUEST));
+            }
+            Bytes::from(decoded)
         };
 
         req.set_payload(Payload::from_stream(OneShot(Some(clean_body))));
         let mut res = ctx.call(&self.service, req).await.map_err(Err::Container::from)?;
 
-        // Стримовые тела (`ResponseBody::Other`) — не наши: их байты пойдут
-        // клиенту как есть (картинки, файлы). `take_body()` их бы обнулил,
-        // поэтому проверяем вариант по ссылке и выходим ДО изъятия тела.
-        if matches!(res.response().body(), ResponseBody::Other(_)) {
-            with_cors(res.headers_mut());
-            return Ok(res);
+        // Стримовые тела (`ResponseBody::Other`) — не наши: байты идут клиенту
+        // как есть (картинки, файлы). `take_body()` их бы обнулил, поэтому
+        // проверяем вариант по ссылке ДО изъятия тела.
+        if !matches!(res.response().body(), ResponseBody::Other(_)) {
+            res = encode_response(&self.state, res);
         }
-
-        let raw = match res.take_body() {
-            ResponseBody::Body(b) => body_to_bytes(&b),
-            // Недостижимо: выше поймали Other до take_body.
-            ResponseBody::Other(_) => {
-                with_cors(res.headers_mut());
-                return Ok(res);
-            },
-        };
-
-        if raw.is_empty() {
-            with_cors(res.headers_mut());
-            Ok(res.map_body(|_head, _body| ResponseBody::Body(Body::Empty)))
-        } else {
-            let rk = self.state.next_resp_key();
-            let buf = encode_frame(&raw, rk);
-            res = res.map_body(|_head, _body| ResponseBody::from(Body::from(buf)));
-            if let Ok(val) = HeaderValue::from_str(&rk.to_string()) {
-                res.headers_mut().insert(HeaderName::from_static(KEY_HEADER), val);
-            }
-            with_cors(res.headers_mut());
-            Ok(res)
-        }
+        with_cors(res.headers_mut());
+        Ok(res)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ntex::web::{self, test};
 
     fn sample_plaintext() -> Vec<u8> {
         let mut v = Vec::new();
@@ -493,32 +544,87 @@ mod tests {
         v
     }
 
+    fn noise(n: usize) -> Vec<u8> {
+        let mut st = 12345u32;
+        (0..n)
+            .map(|_| {
+                st = st.wrapping_add(GAMMA);
+                fmix32(st) as u8
+            })
+            .collect()
+    }
+
     #[test]
-    fn roundtrip_all_keys() {
-        for key in [0u32, 1, 0xDEADBEEF, 0xFFFFFFFF, 123456789] {
-            let mut data = (0..=255u8).cycle().take(1000).collect::<Vec<u8>>();
-            let orig = data.clone();
-            encode_body(&mut data, key);
-            assert_ne!(data, orig);
-            decode_body(&mut data, key);
-            assert_eq!(data, orig);
+    fn keystream_is_involution_for_all_lengths() {
+        for key in [0u32, 1, 0xDEADBEEF, 0xFFFFFFFF] {
+            for len in 0..70 {
+                let orig = noise(len);
+                let mut data = orig.clone();
+                xor_in_place(&mut data, key);
+                if len >= 4 {
+                    assert_ne!(data, orig);
+                }
+                xor_in_place(&mut data, key);
+                assert_eq!(data, orig, "key {key} len {len}");
+            }
         }
     }
 
     #[test]
-    fn frame_roundtrip() {
-        let plain = sample_plaintext();
-        for key in [0u32, 42, 0xCAFEBABE] {
-            let frame = encode_frame(&plain, key);
-            assert_eq!(decode_frame(&frame, key), Some(plain.clone()));
+    fn keystream_differs_per_key_and_has_no_short_period() {
+        let zeros = vec![0u8; 256];
+        let (mut a, mut b) = (zeros.clone(), zeros.clone());
+        xor_in_place(&mut a, 1);
+        xor_in_place(&mut b, 2);
+        assert_ne!(a, b);
+        assert_ne!(a[..32], a[32..64]);
+    }
+
+    #[test]
+    fn frame_roundtrip_all_sizes() {
+        for len in [0usize, 1, 2, 3, 31, 32, 33, 100, 4096, 70_000] {
+            for payload in [vec![7u8; len], noise(len)] {
+                for key in [0u32, 42, 0xCAFEBABE] {
+                    let frame = encode_frame(&payload, key);
+                    assert_eq!(decode_frame(&frame, key), Some(payload.clone()), "len {len}");
+                    assert_eq!(decode_frame_owned(frame, key), Some(payload.clone()));
+                }
+            }
         }
+    }
+
+    #[test]
+    fn tiny_and_incompressible_stay_raw() {
+        let tiny = encode_frame(b"hello", 9);
+        assert_eq!(tiny.len(), HEADER_LEN + 5);
+
+        let n = noise(4096);
+        let frame = encode_frame(&n, 9);
+        assert_eq!(frame.len(), HEADER_LEN + n.len(), "incompressible must not grow beyond header");
     }
 
     #[test]
     fn wrong_key_fails() {
-        let plain = b"hello world";
-        let frame = encode_frame(plain, 42);
-        assert!(decode_frame(&frame, 43).is_none());
+        for payload in [&b"hello world"[..], &[1u8; 1000][..]] {
+            let frame = encode_frame(payload, 42);
+            assert!(decode_frame(&frame, 43).is_none());
+        }
+    }
+
+    #[test]
+    fn garbage_frames_rejected() {
+        assert!(decode_frame(&[], 1).is_none());
+        assert!(decode_frame(&[1, 2], 1).is_none());
+
+        // валидный заголовок, но оборванный deflate
+        let mut frame = encode_frame(&sample_plaintext(), 5);
+        frame.truncate(frame.len() / 2);
+        assert!(decode_frame(&frame, 5).is_none());
+
+        // неизвестный режим
+        let mut bad = [MAGIC[0], MAGIC[1], 9, 0, 0].to_vec();
+        xor_in_place(&mut bad, 5);
+        assert!(decode_frame(&bad, 5).is_none());
     }
 
     #[test]
@@ -533,13 +639,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deflate_bomb_rejected() {
+        let bomb = vec![0u8; MAX_BODY_LEN + 1];
+        let frame = encode_frame(&bomb, 7);
+        assert!(frame.len() < 64 * 1024, "bomb must be tiny on the wire: {}", frame.len());
+        assert!(decode_frame(&frame, 7).is_none());
+        // ровно на лимите — проходит
+        let ok = vec![0u8; MAX_BODY_LEN];
+        assert_eq!(decode_frame(&encode_frame(&ok, 7), 7).map(|v| v.len()), Some(MAX_BODY_LEN));
+    }
+
+    #[test]
+    fn claim_is_single_use_and_rotates() {
+        let state = XorState::new(16, Duration::from_secs(60));
+        assert!(state.is_fresh(5));
+        assert!(state.claim(5));
+        assert!(!state.is_fresh(5));
+        assert!(!state.claim(5));
+
+        // после одной ротации ключ ещё помнится (предыдущий буфер)…
+        state.rotate_bitsets();
+        assert!(!state.claim(5));
+        // …после второй — забыт.
+        state.rotate_bitsets();
+        assert!(state.claim(5));
+    }
+
+    #[test]
+    fn claim_race_has_single_winner() {
+        let state = XorState::new(16, Duration::from_secs(60));
+        let wins: usize = (0..8)
+            .map(|_| {
+                let s = state.clone();
+                std::thread::spawn(move || s.claim(99))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| usize::from(h.join().unwrap()))
+            .sum();
+        assert_eq!(wins, 1);
+    }
+
+    /// ~20k честных запросов в окне при боевом размере битсета: ложных
+    /// реплеев (коллизий) должно быть единицы, а не десятки (было ~0.3%).
+    #[test]
+    fn false_replay_rate_is_low() {
+        let state = XorState::new(65536, Duration::from_secs(60));
+        let mut st = 1u32;
+        let rejected = (0..20_000)
+            .filter(|_| {
+                st = st.wrapping_add(GAMMA);
+                !state.claim(fmix32(st ^ 0xABCD))
+            })
+            .count();
+        assert!(rejected < 20, "false replays: {rejected}/20000");
+    }
+
+    #[test]
+    fn cors_exposes_response_key() {
+        // Кросс-доменный JS читает только safelisted-заголовки: без
+        // expose-headers клиент не увидит `x-key` и не декодирует кадр.
+        let mut headers = HeaderMap::new();
+        with_cors(&mut headers);
+        assert_eq!(headers.get("access-control-expose-headers").unwrap(), "x-key");
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+    }
+
     /// Стримовое (`ResponseBody::Other`) тело — не наше: байты обязаны дойти
     /// до клиента как есть, без XOR-кадра. Регресс: `take_body()` их обнулял.
     #[ntex::test]
     async fn other_body_passes_through() {
-        use ntex::http::body::Body;
-        use ntex::web::{self, test};
-
         let state = XorState::new(1024, Duration::from_secs(60));
         let app = test::init_service(
             web::App::new().middleware(XorMiddleware::new(state)).service(
@@ -557,27 +727,48 @@ mod tests {
 
         let req = test::TestRequest::get().uri("/img").to_request();
         let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), ntex::http::StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let body = test::read_body(resp).await;
         assert_eq!(body.as_ref(), b"PNGDATA", "тело искажено middleware");
     }
 
-    #[test]
-    fn cors_exposes_response_key() {
-        // Кросс-доменный JS читает только safelisted-заголовки: без
-        // expose-headers клиент не увидит `x-key` и не декодирует кадр.
-        let mut headers = ntex::http::header::HeaderMap::new();
-        with_cors(&mut headers);
-        let exposed = headers
-            .get("access-control-expose-headers")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(exposed, "x-key");
-        assert_eq!(
-            headers.get("access-control-allow-origin").unwrap(),
-            "*"
-        );
+    /// Эхо-эндпоинт: запрос -> декод -> хендлер -> кадр с `x-key` ответа;
+    /// повтор того же ключа -> 400.
+    #[ntex::test]
+    async fn middleware_roundtrip_and_replay() {
+        let state = XorState::new(1024, Duration::from_secs(60));
+        let app = test::init_service(
+            web::App::new().middleware(XorMiddleware::new(state)).service(
+                web::resource("/echo")
+                    .route(web::post().to(|body: Bytes| async move { web::HttpResponse::Ok().body(body) })),
+            ),
+        )
+        .await;
+
+        let key = 0x1234_5678u32;
+        // эхо-хендлер: дефолтный лимит web::Bytes-экстрактора < размера sample
+        let plain = sample_plaintext()[..20_000].to_vec();
+        let frame = encode_frame(&plain, key);
+        let call = |frame: Vec<u8>| {
+            test::TestRequest::post()
+                .uri("/echo")
+                .header(KEY_HEADER, key.to_string())
+                .set_payload(frame)
+                .to_request()
+        };
+
+        let resp = test::call_service(&app, call(frame.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_key: u32 = resp.headers().get(KEY_HEADER).unwrap().to_str().unwrap().parse().unwrap();
+        let body = test::read_body(resp).await;
+        assert_eq!(decode_frame(&body, resp_key).unwrap(), plain);
+
+        let replay = test::call_service(&app, call(frame)).await;
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+
+        let no_key = test::TestRequest::post().uri("/echo").set_payload(vec![1, 2, 3]).to_request();
+        assert_eq!(test::call_service(&app, no_key).await.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -599,7 +790,10 @@ mod tests {
         let dec_mb_s = (plain.len() * n) as f64 / t.elapsed().as_secs_f64() / 1e6;
 
         println!("encode: {enc_mb_s:.0} MB/s, decode: {dec_mb_s:.0} MB/s");
-        assert!(enc_mb_s > 50.0, "encode too slow: {enc_mb_s}");
-        assert!(dec_mb_s > 50.0, "decode too slow: {dec_mb_s}");
+        // Пороги осмысленны только для оптимизированной сборки.
+        if !cfg!(debug_assertions) {
+            assert!(enc_mb_s > 100.0, "encode too slow: {enc_mb_s}");
+            assert!(dec_mb_s > 500.0, "decode too slow: {dec_mb_s}");
+        }
     }
 }
