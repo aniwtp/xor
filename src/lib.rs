@@ -413,8 +413,8 @@ pub fn origin_allowed(origin: &str) -> bool {
 /// отражает конкретный разрешённый `Origin` (см. [`origin_allowed`]) вместе с
 /// `access-control-allow-credentials: true` и `vary: origin`. Для чужого или
 /// отсутствующего `Origin` CORS-заголовков нет — браузер заблокирует ответ.
-/// Публичная: error_response хендлеры сервисов добавляют её вручную
-/// (передавая заголовки запроса), т.к. middleware не видит ответы ошибок.
+/// Middleware ставит их на все ответы, включая ошибки хендлеров (тест
+/// `handler_errors_get_cors`); публичная — для ответов, собранных вне middleware.
 pub fn with_cors(req_headers: &HeaderMap, headers: &mut HeaderMap) {
     apply_cors(req_headers.get(&HEADERS.origin), headers);
 }
@@ -819,6 +819,43 @@ mod tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let body = test::read_body(resp).await;
         assert_eq!(body.as_ref(), b"PNGDATA", "тело искажено middleware");
+    }
+
+    #[derive(Debug)]
+    struct Boom;
+    impl std::fmt::Display for Boom {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("boom")
+        }
+    }
+    impl web::error::WebResponseError for Boom {
+        fn status_code(&self) -> StatusCode {
+            StatusCode::UNAUTHORIZED
+        }
+    }
+
+    /// Ошибка хендлера (`Err`) тоже получает credentialed CORS: фронт должен
+    /// видеть 401 (иначе не запустит refresh), а не сетевую ошибку.
+    #[ntex::test]
+    async fn handler_errors_get_cors() {
+        let state = XorState::new(1024, Duration::from_secs(60));
+        let app = test::init_service(
+            web::App::new().middleware(XorMiddleware::new(state)).service(
+                web::resource("/err").route(web::get().to(|| async { Err::<web::HttpResponse, _>(Boom) })),
+            ),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/err")
+            .header("origin", "https://api.kuma.pics")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://api.kuma.pics"
+        );
+        assert_eq!(resp.headers().get("access-control-allow-credentials").unwrap(), "true");
     }
 
     /// Эхо-эндпоинт: запрос -> декод -> хендлер -> кадр с `x-key` ответа;
