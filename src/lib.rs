@@ -351,6 +351,9 @@ async fn drain_payload(pl: &mut Payload, size_hint: usize) -> Result<Vec<u8>, Dr
 /// каждый ответ.
 struct Headers {
     key: HeaderName,
+    origin: HeaderName,
+    vary: HeaderName,
+    /// Статичные CORS-заголовки (кроме `access-control-allow-origin`, он зависит от запроса).
     cors: [(HeaderName, HeaderValue); 5],
 }
 
@@ -360,9 +363,11 @@ static HEADERS: LazyLock<Headers> = LazyLock::new(|| {
     };
     Headers {
         key: HeaderName::from_static(KEY_HEADER),
+        origin: HeaderName::from_static("origin"),
+        vary: HeaderName::from_static("vary"),
         cors: [
-            h("access-control-allow-origin", "*"),
-            h("access-control-allow-headers", "x-key, X-Session-Token, X-Team-Token, content-type"),
+            h("access-control-allow-credentials", "true"),
+            h("access-control-allow-headers", "x-key, content-type"),
             h("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS"),
             h("access-control-max-age", "86400"),
             // Ключ ответа обязан быть ВИДИМ кросс-доменному JS: без expose-headers
@@ -373,19 +378,64 @@ static HEADERS: LazyLock<Headers> = LazyLock::new(|| {
     }
 });
 
-/// CORS-заголовки для браузерных фронтов: токены едут заголовками
-/// (`x-key`, `X-Session-Token`, `X-Team-Token`), кук нет — `*` достаточно.
-/// Публичная: error_response хендлеры сервисов добавляют её вручную,
-/// т.к. middleware не видит ответы ошибок.
-pub fn with_cors(headers: &mut HeaderMap) {
+/// Домен сайтов по умолчанию: куки (`Domain=`) и credentialed CORS действуют
+/// на него и все его поддомены. Переопределяется переменной окружения
+/// [`COOKIE_DOMAIN_ENV`] (должна совпадать с `COOKIE_DOMAIN` у `user-validate`).
+pub const DEFAULT_COOKIE_DOMAIN: &str = "kuma.pics";
+pub const COOKIE_DOMAIN_ENV: &str = "COOKIE_DOMAIN";
+
+static COOKIE_DOMAIN: LazyLock<String> = LazyLock::new(|| {
+    std::env::var(COOKIE_DOMAIN_ENV)
+        .ok()
+        .map(|d| d.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| DEFAULT_COOKIE_DOMAIN.to_owned())
+});
+
+/// Origin разрешён, если это `https://<домен>` или `https://<любой.поддомен>.<домен>`
+/// без порта и пути. Куки-сессия шлётся только таким фронтам.
+pub fn origin_allowed(origin: &str) -> bool {
+    let Some(host) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    let domain = COOKIE_DOMAIN.as_str();
+    let valid = !host.is_empty()
+        && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && !host.starts_with(['.', '-'])
+        && !host.contains("..");
+    valid
+        && (host == domain
+            || host.strip_suffix(domain).is_some_and(|rest| rest.len() > 1 && rest.ends_with('.')))
+}
+
+/// CORS-заголовки для браузерных фронтов. Токены едут куками
+/// (`credentials: 'include'`), поэтому `*` нельзя: `access-control-allow-origin`
+/// отражает конкретный разрешённый `Origin` (см. [`origin_allowed`]) вместе с
+/// `access-control-allow-credentials: true` и `vary: origin`. Для чужого или
+/// отсутствующего `Origin` CORS-заголовков нет — браузер заблокирует ответ.
+/// Публичная: error_response хендлеры сервисов добавляют её вручную
+/// (передавая заголовки запроса), т.к. middleware не видит ответы ошибок.
+pub fn with_cors(req_headers: &HeaderMap, headers: &mut HeaderMap) {
+    apply_cors(req_headers.get(&HEADERS.origin), headers);
+}
+
+fn apply_cors(origin: Option<&HeaderValue>, headers: &mut HeaderMap) {
+    if !headers.get_all(&HEADERS.vary).any(|v| v.as_bytes().eq_ignore_ascii_case(b"origin")) {
+        headers.append(HEADERS.vary.clone(), HeaderValue::from_static("origin"));
+    }
+    let Some(origin) = origin.filter(|o| o.to_str().is_ok_and(origin_allowed)) else {
+        return;
+    };
+    headers.insert(HeaderName::from_static("access-control-allow-origin"), origin.clone());
     for (name, value) in &HEADERS.cors {
         headers.insert(name.clone(), value.clone());
     }
 }
 
 fn reject<Err: ErrorRenderer>(req: WebRequest<Err>, status: StatusCode) -> WebResponse {
+    let origin = req.headers().get(&HEADERS.origin).cloned();
     let mut res = req.into_response(ntex::http::Response::new(status));
-    with_cors(res.headers_mut());
+    apply_cors(origin.as_ref(), res.headers_mut());
     res
 }
 
@@ -460,9 +510,10 @@ where
     ) -> Result<WebResponse, Self::Error> {
         // CORS для браузерных фронтов (админка ходит на домены сервисов
         // напрямую): preflight закрываем здесь, остальным ставим заголовки внизу.
+        let origin = req.headers().get(&HEADERS.origin).cloned();
         if req.method() == Method::OPTIONS {
             let mut res = req.into_response(ntex::http::Response::new(StatusCode::NO_CONTENT));
-            with_cors(res.headers_mut());
+            apply_cors(origin.as_ref(), res.headers_mut());
             return Ok(res);
         }
 
@@ -520,7 +571,7 @@ where
         if !matches!(res.response().body(), ResponseBody::Other(_)) {
             res = encode_response(&self.state, res);
         }
-        with_cors(res.headers_mut());
+        apply_cors(origin.as_ref(), res.headers_mut());
         Ok(res)
     }
 }
@@ -696,14 +747,51 @@ mod tests {
         assert!(rejected < 20, "false replays: {rejected}/20000");
     }
 
+    fn req_with_origin(origin: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(HeaderName::from_static("origin"), HeaderValue::from_str(origin).unwrap());
+        h
+    }
+
     #[test]
-    fn cors_exposes_response_key() {
+    fn cors_reflects_allowed_origin_with_credentials() {
         // Кросс-доменный JS читает только safelisted-заголовки: без
         // expose-headers клиент не увидит `x-key` и не декодирует кадр.
         let mut headers = HeaderMap::new();
-        with_cors(&mut headers);
+        with_cors(&req_with_origin("https://api.kuma.pics"), &mut headers);
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "https://api.kuma.pics");
+        assert_eq!(headers.get("access-control-allow-credentials").unwrap(), "true");
         assert_eq!(headers.get("access-control-expose-headers").unwrap(), "x-key");
-        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(headers.get("vary").unwrap(), "origin");
+    }
+
+    #[test]
+    fn cors_rejects_foreign_origins() {
+        for o in [
+            "https://evil.com",
+            "https://kuma.pics.evil.com",
+            "https://evilkuma.pics",
+            "http://a.kuma.pics",
+            "https://a.kuma.pics:8443",
+            "https://.kuma.pics",
+            "https://a..kuma.pics",
+            "null",
+        ] {
+            let mut headers = HeaderMap::new();
+            with_cors(&req_with_origin(o), &mut headers);
+            assert!(headers.get("access-control-allow-origin").is_none(), "{o} разрешён");
+            assert!(headers.get("access-control-allow-credentials").is_none(), "{o}");
+        }
+        let mut headers = HeaderMap::new();
+        with_cors(&HeaderMap::new(), &mut headers);
+        assert!(headers.get("access-control-allow-origin").is_none());
+    }
+
+    #[test]
+    fn cors_allows_apex_and_nested_subdomains() {
+        assert!(origin_allowed("https://kuma.pics"));
+        assert!(origin_allowed("https://auth.kuma.pics"));
+        assert!(origin_allowed("https://a.b.kuma.pics"));
     }
 
     /// Стримовое (`ResponseBody::Other`) тело — не наше: байты обязаны дойти
