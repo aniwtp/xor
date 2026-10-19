@@ -354,7 +354,8 @@ struct Headers {
     origin: HeaderName,
     vary: HeaderName,
     /// Статичные CORS-заголовки (кроме `access-control-allow-origin`, он зависит от запроса).
-    cors: [(HeaderName, HeaderValue); 5],
+    cors: [(HeaderName, HeaderValue); 4],
+    credentials: (HeaderName, HeaderValue),
 }
 
 static HEADERS: LazyLock<Headers> = LazyLock::new(|| {
@@ -365,8 +366,8 @@ static HEADERS: LazyLock<Headers> = LazyLock::new(|| {
         key: HeaderName::from_static(KEY_HEADER),
         origin: HeaderName::from_static("origin"),
         vary: HeaderName::from_static("vary"),
+        credentials: h("access-control-allow-credentials", "true"),
         cors: [
-            h("access-control-allow-credentials", "true"),
             h("access-control-allow-headers", "x-key, content-type"),
             h("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS"),
             h("access-control-max-age", "86400"),
@@ -408,11 +409,16 @@ pub fn origin_allowed(origin: &str) -> bool {
             || host.strip_suffix(domain).is_some_and(|rest| rest.len() > 1 && rest.ends_with('.')))
 }
 
-/// CORS-заголовки для браузерных фронтов. Токены едут куками
-/// (`credentials: 'include'`), поэтому `*` нельзя: `access-control-allow-origin`
-/// отражает конкретный разрешённый `Origin` (см. [`origin_allowed`]) вместе с
-/// `access-control-allow-credentials: true` и `vary: origin`. Для чужого или
-/// отсутствующего `Origin` CORS-заголовков нет — браузер заблокирует ответ.
+/// CORS-заголовки для браузерных фронтов.
+///
+/// * `Origin` из `https://kuma.pics` / `https://*.kuma.pics` (см. [`origin_allowed`]):
+///   `access-control-allow-origin` отражает его, плюс
+///   `access-control-allow-credentials: true` — фронт может слать куки
+///   (`credentials: 'include'`).
+/// * Любой другой или отсутствующий `Origin` (localhost, dev-стенды): `*` без
+///   credentials. Открытые методы работают с любого фронта, а запрос с
+///   `credentials: 'include'` браузер отклонит сам — куки чужим сайтам не уходят.
+///
 /// Middleware ставит их на все ответы, включая ошибки хендлеров (тест
 /// `handler_errors_get_cors`); публичная — для ответов, собранных вне middleware.
 pub fn with_cors(req_headers: &HeaderMap, headers: &mut HeaderMap) {
@@ -423,10 +429,16 @@ fn apply_cors(origin: Option<&HeaderValue>, headers: &mut HeaderMap) {
     if !headers.get_all(&HEADERS.vary).any(|v| v.as_bytes().eq_ignore_ascii_case(b"origin")) {
         headers.append(HEADERS.vary.clone(), HeaderValue::from_static("origin"));
     }
-    let Some(origin) = origin.filter(|o| o.to_str().is_ok_and(origin_allowed)) else {
-        return;
-    };
-    headers.insert(HeaderName::from_static("access-control-allow-origin"), origin.clone());
+    let allow_origin = HeaderName::from_static("access-control-allow-origin");
+    match origin.filter(|o| o.to_str().is_ok_and(origin_allowed)) {
+        Some(origin) => {
+            headers.insert(allow_origin, origin.clone());
+            headers.insert(HEADERS.credentials.0.clone(), HEADERS.credentials.1.clone());
+        },
+        None => {
+            headers.insert(allow_origin, HeaderValue::from_static("*"));
+        },
+    }
     for (name, value) in &HEADERS.cors {
         headers.insert(name.clone(), value.clone());
     }
@@ -766,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn cors_rejects_foreign_origins() {
+    fn cors_foreign_origins_get_wildcard_without_credentials() {
         for o in [
             "https://evil.com",
             "https://kuma.pics.evil.com",
@@ -779,12 +791,18 @@ mod tests {
         ] {
             let mut headers = HeaderMap::new();
             with_cors(&req_with_origin(o), &mut headers);
-            assert!(headers.get("access-control-allow-origin").is_none(), "{o} разрешён");
+            assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*", "{o}");
             assert!(headers.get("access-control-allow-credentials").is_none(), "{o}");
+            assert_eq!(headers.get("access-control-expose-headers").unwrap(), "x-key");
         }
+        // dev-фронт: открытые методы доступны без кук
+        let mut headers = HeaderMap::new();
+        with_cors(&req_with_origin("http://localhost:5173"), &mut headers);
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert!(headers.get("access-control-allow-credentials").is_none());
         let mut headers = HeaderMap::new();
         with_cors(&HeaderMap::new(), &mut headers);
-        assert!(headers.get("access-control-allow-origin").is_none());
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
     }
 
     #[test]
