@@ -36,14 +36,13 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
-use ntex::SharedCfg;
 use ntex::http::body::{Body, ResponseBody};
 use ntex::http::error::PayloadError;
 use ntex::http::header::{HeaderMap, HeaderName, HeaderValue};
 use ntex::http::{Method, Payload, StatusCode};
-use ntex::service::{Middleware, Service, ServiceCtx};
+use ntex::service::{Ctx, Middleware, Service};
 use ntex::util::{Bytes, Stream};
-use ntex::web::{ErrorRenderer, WebRequest, WebResponse};
+use ntex::web::{WebRequest, WebResponse};
 
 pub const KEY_HEADER: &str = "x-key";
 
@@ -444,7 +443,7 @@ fn apply_cors(origin: Option<&HeaderValue>, headers: &mut HeaderMap) {
     }
 }
 
-fn reject<Err: ErrorRenderer>(req: WebRequest<Err>, status: StatusCode) -> WebResponse {
+fn reject<In>(req: WebRequest<In>, status: StatusCode) -> WebResponse {
     let origin = req.headers().get(&HEADERS.origin).cloned();
     let mut res = req.into_response(ntex::http::Response::new(status));
     apply_cors(origin.as_ref(), res.headers_mut());
@@ -481,10 +480,10 @@ impl XorMiddleware {
     }
 }
 
-impl<S> Middleware<S, SharedCfg> for XorMiddleware {
+impl<S, St> Middleware<S, St> for XorMiddleware {
     type Service = XorService<S>;
 
-    fn create(&self, service: S, _cfg: SharedCfg) -> Self::Service {
+    fn create(&self, _: &St, service: S) -> Self::Service {
         XorService { service, state: self.state.clone() }
     }
 }
@@ -494,31 +493,21 @@ pub struct XorService<S> {
     state: XorState,
 }
 
-impl<S, Err> Service<WebRequest<Err>> for XorService<S>
+impl<S, St, In> Service<St, WebRequest<In>> for XorService<S>
 where
-    S: Service<WebRequest<Err>, Response = WebResponse>,
-    Err: ErrorRenderer,
-    Err::Container: From<<S as Service<WebRequest<Err>>>::Error>,
+    S: Service<St, WebRequest<In>, Res = WebResponse>,
 {
-    type Response = WebResponse;
-    type Error = Err::Container;
+    type Res = WebResponse;
+    type Error = S::Error;
 
-    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
-        ctx.ready(&self.service).await.map_err(Into::into)
-    }
-
-    fn poll(&self, cx: &mut Context<'_>) -> Result<(), Self::Error> {
-        self.service.poll(cx).map_err(Into::into)
-    }
-
-    async fn shutdown(&self) {
-        self.service.shutdown().await;
-    }
+    ntex::forward_bind!(St, service);
+    ntex::forward_ready!(St, service);
+    ntex::forward_shutdown!(St, service);
 
     async fn call(
         &self,
-        mut req: WebRequest<Err>,
-        ctx: ServiceCtx<'_, Self>,
+        mut req: WebRequest<In>,
+        ctx: Ctx<'_, Self, St>,
     ) -> Result<WebResponse, Self::Error> {
         // CORS для браузерных фронтов (админка ходит на домены сервисов
         // напрямую): preflight закрываем здесь, остальным ставим заголовки внизу.
@@ -575,7 +564,7 @@ where
         };
 
         req.set_payload(Payload::from_stream(OneShot(Some(clean_body))));
-        let mut res = ctx.call(&self.service, req).await.map_err(Err::Container::from)?;
+        let mut res = ctx.call(&self.service, req).await?;
 
         // Стримовые тела (`ResponseBody::Other`) — не наши: байты идут клиенту
         // как есть (картинки, файлы). `take_body()` их бы обнулил, поэтому
@@ -820,7 +809,7 @@ mod tests {
         let app = test::init_service(
             web::App::new().middleware(XorMiddleware::new(state)).service(
                 web::resource("/img").route(web::get().to(|| async {
-                    Ok::<_, web::Error>(
+                    Ok::<_, web::WebError>(
                         web::HttpResponse::Ok()
                             .content_type("image/png")
                             .body(Body::from_slice(b"PNGDATA"))
@@ -846,9 +835,10 @@ mod tests {
             f.write_str("boom")
         }
     }
-    impl web::error::WebResponseError for Boom {
-        fn status_code(&self) -> StatusCode {
-            StatusCode::UNAUTHORIZED
+    impl std::error::Error for Boom {}
+    impl<St> web::WebResponseError<St, web::DefaultError> for Boom {
+        fn error_response(&self, _: &St) -> web::HttpResponse {
+            web::HttpResponse::new(StatusCode::UNAUTHORIZED)
         }
     }
 
@@ -897,7 +887,7 @@ mod tests {
             test::TestRequest::post()
                 .uri("/echo")
                 .header(KEY_HEADER, key.to_string())
-                .set_payload(frame)
+                .payload(frame)
                 .to_request()
         };
 
@@ -910,7 +900,7 @@ mod tests {
         let replay = test::call_service(&app, call(frame)).await;
         assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
 
-        let no_key = test::TestRequest::post().uri("/echo").set_payload(vec![1, 2, 3]).to_request();
+        let no_key = test::TestRequest::post().uri("/echo").payload(vec![1, 2, 3]).to_request();
         assert_eq!(test::call_service(&app, no_key).await.status(), StatusCode::BAD_REQUEST);
     }
 
