@@ -866,6 +866,33 @@ mod tests {
         assert_eq!(resp.headers().get("access-control-allow-credentials").unwrap(), "true");
     }
 
+    #[derive(Clone)]
+    struct AppSt;
+    impl web::State for AppSt {
+        type Error = web::DefaultError;
+    }
+
+    /// То же для приложения со своим state и `to_with_state`-хендлерами (так
+    /// устроены сервисы).
+    #[ntex::test]
+    async fn stateful_handler_errors_get_cors() {
+        async fn fail(_: &AppSt, _: ()) -> Result<web::HttpResponse, Boom> {
+            Err(Boom)
+        }
+        let state = XorState::new(1024, Duration::from_secs(60));
+        let app = test::init_service_st(
+            AppSt,
+            web::App::<AppSt>::new()
+                .middleware(XorMiddleware::new(state))
+                .service(web::resource("/err").route(web::get().to_with_state(fail))),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/err").header("origin", "https://api.kuma.pics").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "https://api.kuma.pics");
+    }
+
     /// Эхо-эндпоинт: запрос -> декод -> хендлер -> кадр с `x-key` ответа;
     /// повтор того же ключа -> 400.
     #[ntex::test]
